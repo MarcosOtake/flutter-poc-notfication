@@ -44,6 +44,13 @@ Future<void> main() async {
           AndroidFlutterLocalNotificationsPlugin>()
       ?.createNotificationChannel(_channel);
 
+  // Inicializa o plugin de notificações locais
+  const AndroidInitializationSettings initializationSettingsAndroid =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initializationSettings =
+      InitializationSettings(android: initializationSettingsAndroid);
+  await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
   // 4. Habilita exibição de notificações em foreground (iOS)
   await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
     alert: true,

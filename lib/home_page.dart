@@ -1,7 +1,10 @@
+import 'dart:convert';
+
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:http/http.dart' as http;
 
 import 'main.dart';
 
@@ -16,6 +19,8 @@ class _HomePageState extends State<HomePage> {
   String _fcmToken = 'Obtendo token...';
   final List<_NotificationItem> _notifications = [];
   bool _permissionGranted = false;
+
+  int get _unreadCount => _notifications.where((n) => !n.isRead).length;
 
   @override
   void initState() {
@@ -46,13 +51,29 @@ class _HomePageState extends State<HomePage> {
     });
     debugPrint('🔑 FCM Token: $token');
 
-    // ── 3. Listener de foreground ───────────────────────────────────────────
+    // ── 2.1 Registrar token no backend ─────────────────────────────────────
+    if (token != null) {
+      try {
+        await http.post(
+          Uri.parse('http://192.168.0.161:3000/api/devices/register'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'fcm_token': token,
+            'platform': 'android',
+          }),
+        );
+        debugPrint('✅ Token registrado no backend!');
+      } catch (e) {
+        debugPrint('⚠️ Falha ao registrar token no backend: $e');
+      }
+    }
+
+    // ── 3. Listener de foreground — entra como NÃO LIDO ────────────────────
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
       debugPrint('📱 [FOREGROUND] Mensagem recebida: ${message.messageId}');
 
       final notification = message.notification;
       if (notification != null) {
-        // Exibe notificação local quando app está em foreground
         flutterLocalNotificationsPlugin.show(
           notification.hashCode,
           notification.title,
@@ -64,7 +85,8 @@ class _HomePageState extends State<HomePage> {
               channelDescription: 'Canal para notificações importantes',
               importance: Importance.max,
               priority: Priority.high,
-              icon: '@mipmap/ic_launcher',
+              icon: '@drawable/ic_notification',
+              color: const Color(0xFFFF9800),
             ),
           ),
         );
@@ -74,36 +96,107 @@ class _HomePageState extends State<HomePage> {
         _notifications.insert(
           0,
           _NotificationItem(
+            notificationId: message.data['notification_id'] as String?,
             title: message.notification?.title ?? '(sem título)',
             body: message.notification?.body ?? '(sem corpo)',
             time: DateTime.now(),
             state: 'foreground',
+            isRead: false, // foreground entra como não lido
           ),
         );
       });
     });
 
-    // ── 4. Listener de tap em notificação (background/terminated) ──────────
+    // ── 4. Tap no sistema (background) — entra como LIDO ──────────────────
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
       debugPrint('👆 App aberto via notificação: ${message.messageId}');
+      _reportNotificationClicked(message);
       setState(() {
         _notifications.insert(
           0,
           _NotificationItem(
+            notificationId: message.data['notification_id'] as String?,
             title: message.notification?.title ?? '(sem título)',
             body: message.notification?.body ?? '(sem corpo)',
             time: DateTime.now(),
             state: 'tap',
+            isRead: true, // tap no sistema já conta como lido
           ),
         );
       });
     });
+
+    // ── 4.1 App estava fechado — entra como LIDO ──────────────────────────
+    final initialMessage =
+        await FirebaseMessaging.instance.getInitialMessage();
+    if (initialMessage != null) {
+      debugPrint(
+          '🚀 App iniciado via notificação: ${initialMessage.messageId}');
+      _reportNotificationClicked(initialMessage);
+      setState(() {
+        _notifications.insert(
+          0,
+          _NotificationItem(
+            notificationId:
+                initialMessage.data['notification_id'] as String?,
+            title: initialMessage.notification?.title ?? '(sem título)',
+            body: initialMessage.notification?.body ?? '(sem corpo)',
+            time: DateTime.now(),
+            state: 'tap',
+            isRead: true,
+          ),
+        );
+      });
+    }
 
     // ── 5. Renovação de token ───────────────────────────────────────────────
     messaging.onTokenRefresh.listen((newToken) {
       debugPrint('🔄 Token renovado: $newToken');
       setState(() => _fcmToken = newToken);
     });
+  }
+
+  Future<void> _reportNotificationClicked(RemoteMessage message) async {
+    final notificationId = message.data['notification_id'] as String?;
+    if (notificationId == null) {
+      debugPrint('⚠️ Notificação sem notification_id, clique não rastreado.');
+      return;
+    }
+    try {
+      final response = await http.post(
+        Uri.parse(
+            'http://192.168.0.161:3000/api/notifications/$notificationId/clicked'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'fcm_token': _fcmToken}),
+      );
+      debugPrint('✅ Clique registrado (status ${response.statusCode})');
+    } catch (e) {
+      debugPrint('⚠️ Falha ao registrar clique: $e');
+    }
+  }
+
+  Future<void> _markAsRead(int index) async {
+    final item = _notifications[index];
+    if (item.isRead) return;
+
+    setState(() {
+      _notifications[index] = item.copyWith(isRead: true);
+    });
+
+    if (item.notificationId != null) {
+      try {
+        final response = await http.post(
+          Uri.parse(
+              'http://192.168.0.161:3000/api/notifications/${item.notificationId}/clicked'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'fcm_token': _fcmToken}),
+        );
+        debugPrint(
+            '✅ Marcado como lido no backend (status ${response.statusCode})');
+      } catch (e) {
+        debugPrint('⚠️ Falha ao marcar como lido no backend: $e');
+      }
+    }
   }
 
   Future<void> _copyToken() async {
@@ -205,15 +298,31 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 16),
 
-            // ── Lista de notificações recebidas ─────────────────────────────
+            // ── Cabeçalho da lista ──────────────────────────────────────────
             Row(
               children: [
                 const Icon(Icons.notifications),
                 const SizedBox(width: 8),
                 Text(
-                  'Notificações recebidas (${_notifications.length})',
+                  'Notificações (${_notifications.length})',
                   style: theme.textTheme.titleMedium,
                 ),
+                if (_unreadCount > 0) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.blue,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      '$_unreadCount não lida${_unreadCount > 1 ? 's' : ''}',
+                      style: const TextStyle(
+                          color: Colors.white, fontSize: 11),
+                    ),
+                  ),
+                ],
               ],
             ),
             const SizedBox(height: 8),
@@ -243,27 +352,69 @@ class _HomePageState extends State<HomePage> {
                         final item = _notifications[index];
                         return Card(
                           margin: const EdgeInsets.only(bottom: 8),
+                          color: item.isRead
+                              ? null
+                              : Colors.blue.shade50,
                           child: ListTile(
-                            leading: CircleAvatar(
-                              backgroundColor:
-                                  item.state == 'foreground'
+                            onTap: () => _markAsRead(index),
+                            leading: Stack(
+                              clipBehavior: Clip.none,
+                              children: [
+                                CircleAvatar(
+                                  backgroundColor: item.state == 'foreground'
                                       ? Colors.blue.shade100
                                       : Colors.purple.shade100,
-                              child: Icon(
-                                item.state == 'foreground'
-                                    ? Icons.phone_android
-                                    : Icons.touch_app,
-                                size: 18,
-                                color: item.state == 'foreground'
-                                    ? Colors.blue
-                                    : Colors.purple,
+                                  child: Icon(
+                                    item.state == 'foreground'
+                                        ? Icons.phone_android
+                                        : Icons.touch_app,
+                                    size: 18,
+                                    color: item.state == 'foreground'
+                                        ? Colors.blue
+                                        : Colors.purple,
+                                  ),
+                                ),
+                                if (!item.isRead)
+                                  Positioned(
+                                    top: -2,
+                                    right: -2,
+                                    child: Container(
+                                      width: 10,
+                                      height: 10,
+                                      decoration: const BoxDecoration(
+                                        color: Colors.blue,
+                                        shape: BoxShape.circle,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            title: Text(
+                              item.title,
+                              style: TextStyle(
+                                fontWeight: item.isRead
+                                    ? FontWeight.normal
+                                    : FontWeight.bold,
                               ),
                             ),
-                            title: Text(item.title),
                             subtitle: Text(item.body),
-                            trailing: Text(
-                              '${item.time.hour.toString().padLeft(2, '0')}:${item.time.minute.toString().padLeft(2, '0')}',
-                              style: theme.textTheme.bodySmall,
+                            trailing: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  '${item.time.hour.toString().padLeft(2, '0')}:${item.time.minute.toString().padLeft(2, '0')}',
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                                if (!item.isRead)
+                                  Text(
+                                    'toque p/ ler',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      color: Colors.blue.shade400,
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
                         );
@@ -278,15 +429,30 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _NotificationItem {
+  final String? notificationId;
   final String title;
   final String body;
   final DateTime time;
   final String state; // 'foreground' | 'tap'
+  final bool isRead;
 
   _NotificationItem({
+    this.notificationId,
     required this.title,
     required this.body,
     required this.time,
     required this.state,
+    required this.isRead,
   });
+
+  _NotificationItem copyWith({bool? isRead}) {
+    return _NotificationItem(
+      notificationId: notificationId,
+      title: title,
+      body: body,
+      time: time,
+      state: state,
+      isRead: isRead ?? this.isRead,
+    );
+  }
 }
